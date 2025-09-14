@@ -1,4 +1,4 @@
-# main.py — Binance-only bot (robust fetch + startup forced-test)
+# main.py — Binance-only bot (fixed prompt quoting bug)
 import os
 import asyncio
 import time
@@ -80,7 +80,7 @@ async def fetch_candles(session: aiohttp.ClientSession, symbol: str):
         async with session.get(url, timeout=20) as r:
             if r.status != 200:
                 text = await r.text()
-                raise RuntimeError(f"KlInes HTTP {r.status}: {text[:200]}")
+                raise RuntimeError(f"Klines HTTP {r.status}: {text[:200]}")
             data = await r.json()
             candles = [
                 {"open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])}
@@ -96,12 +96,10 @@ async def fetch_oi(session: aiohttp.ClientSession, symbol: str):
     try:
         async with session.get(url, timeout=10) as r:
             if r.status != 200:
-                # futures OI endpoint might 404 for some non-futures symbols on some pairs
                 return None
             d = await r.json()
             return float(d.get("openInterest") or 0)
     except Exception as e:
-        # not fatal; OI optional
         print(f"[WARN] fetch_oi {symbol}: {e}")
         return None
 
@@ -110,18 +108,31 @@ async def openai_analyze(market_map: dict, candle_map: dict):
         print("[WARN] OpenAI client not initialized; skipping analysis.")
         return None
     try:
+        # Build compact prompt safely (avoid nested escaping issues)
         lines = []
         for s, d in market_map.items():
             if d:
                 lines.append(f"{s}: price={d['price']} vol24h={d['volume']} OI={d.get('oi','NA')}")
-        prompt = (
-            "You are a concise crypto technical analyst. Given the following spot summary and recent candlestick OHLC data, "
-            "identify any common chart patterns (e.g., flag, triangle, head & shoulders, double top/bottom), state bias (bullish/bearish/neutral), "
-            "and suggest possible buy/sell signals in one short paragraph.\n\n"
-            "Spot summary:\n" + "\n".join(lines) + "\n\n"
-        )
+        prompt_parts = [
+            "You are a concise crypto technical analyst. Given the following spot summary and recent candlestick OHLC data,",
+            "identify any common chart patterns (e.g., flag, triangle, head & shoulders, double top/bottom), state bias (bullish/bearish/neutral),",
+            "and suggest possible buy/sell signals in one short paragraph.",
+            "",
+            "Spot summary:",
+            "\n".join(lines),
+            ""
+        ]
+        # Append candle lists in a safe, non-escaped way
         for s, candles in candle_map.items():
-            prompt += f"{s} last 10 candles (OHLC): " + ", ".join([f\"[{c['open']},{c['high']},{c['low']},{c['close']}]\" for c in candles[-10:]]) + "\n"
+            # create a short textual representation for last 10 candles
+            last10 = candles[-10:] if candles else []
+            candle_texts = []
+            for c in last10:
+                candle_texts.append(f"[{c.get('open')},{c.get('high')},{c.get('low')},{c.get('close')}]")
+            prompt_parts.append(f"{s} last 10 candles (OHLC): " + ", ".join(candle_texts))
+
+        prompt = "\n".join(prompt_parts)
+
         # call OpenAI in thread
         resp = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -133,9 +144,9 @@ async def openai_analyze(market_map: dict, candle_map: dict):
             ),
         )
         text = resp.choices[0].message.content.strip()
-        # condense: take first 6 lines or full
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        summary = "\n".join(lines[:6]) if len(lines) > 6 else text
+        # condense: take first 6 non-empty lines
+        lines_out = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        summary = "\n".join(lines_out[:6]) if len(lines_out) > 6 else text
         return summary
     except Exception as e:
         print("[ERROR] OpenAI analyze failed:", e)
@@ -171,9 +182,9 @@ async def send_startup_test(session: aiohttp.ClientSession):
     lines = []
     for s, d in market_map.items():
         lines.append(f"*{s}*: {d['price']} (24hVol={d['volume']}, OI={d.get('oi','NA')})")
-    msg = "*Startup test — forced snapshot*\\n" + "\\n".join(lines)
+    msg = "*Startup test — forced snapshot*\n" + "\n".join(lines)
     if analysis:
-        msg += f"\\n\\n🧠 Analysis:\\n{analysis}"
+        msg += f"\n\n🧠 Analysis:\n{analysis}"
     await send_telegram(session, msg)
 
 async def periodic_task():
@@ -208,11 +219,10 @@ async def periodic_task():
                     lines.append(f"*{s}*: {d['price']} (24hVol={d['volume']}, OI={d.get('oi','NA')})")
                 else:
                     lines.append(f"*{s}*: fetch_failed")
-            msg = f"*Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})*\\n" + "\\n".join(lines)
+            msg = f"*Snapshot (UTC {datetime.utcnow().strftime('%H:%M')})*\n" + "\n".join(lines)
             if analysis:
-                # pretty short
-                pretty = "\\n".join([ln.strip() for ln in analysis.splitlines() if ln.strip()][:6])
-                msg += f"\\n\\n🧠 Analysis:\\n{pretty}"
+                pretty = "\n".join([ln.strip() for ln in analysis.splitlines() if ln.strip()][:6])
+                msg += f"\n\n🧠 Analysis:\n{pretty}"
             await send_telegram(session, msg)
             # sleep respecting poll interval
             elapsed = time.time() - start
@@ -230,3 +240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
